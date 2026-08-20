@@ -667,7 +667,7 @@ def _refresh_clickhouse_gold(**context):
     ch = None
     if BaseHook is not None:
         try:
-            conn = BaseHook.get_connection("fraud_clickhouse_default")
+            conn = BaseHook.get_connection("clickhouse_default")
             ch = {"host": conn.host, "port": conn.port or 8123, "user": conn.login or "default",
                   "password": conn.password or "", "db": conn.schema or CLICKHOUSE_DB}
         except Exception:
