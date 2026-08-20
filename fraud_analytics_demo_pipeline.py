@@ -211,10 +211,10 @@ SPARK_SQL_HTTP_TIMEOUT = int(_var("fraud__spark_sql_http_timeout_sec", "320"))
 SPARK_JOB_POLL_INTERVAL = int(_var("fraud__spark_job_poll_interval_sec", "10"))
 SPARK_JOB_POLL_TIMEOUT = int(_var("fraud__spark_job_poll_timeout_sec", "1800"))
 
-DATAHUB_GMS_URL = _var("DATAHUB_GMS_URL", "http://datahub.datahub-tenant.tcs.private.cloud:8080")
+DATAHUB_GMS_URL = _var("DATAHUB_GMS_URL", "http://datahub-datahub-gms.datahub-tenant.svc.cluster.local:8080")
 SUPERSET_DASHBOARD_URL = _var(
     "fraud__superset_dashboard_url",
-    "http://superset-superset-tenant-a.tcs.private.cloud:9001/superset/dashboard/fraud_demo/",
+    "http://superset.superset-tenant-a.svc.cluster.local:8088/superset/dashboard/fraud_demo/",
 )
 
 SEED = 42
