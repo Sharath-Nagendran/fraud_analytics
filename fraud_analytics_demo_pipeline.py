@@ -211,6 +211,7 @@ SPARK_SQL_HTTP_TIMEOUT = int(_var("fraud__spark_sql_http_timeout_sec", "320"))
 SPARK_JOB_POLL_INTERVAL = int(_var("fraud__spark_job_poll_interval_sec", "10"))
 SPARK_JOB_POLL_TIMEOUT = int(_var("fraud__spark_job_poll_timeout_sec", "1800"))
 
+DATAHUB_TOKEN = _var("DATAHUB_GMS_TOKEN", "eyJhbGciOiJIUzI1NiJ9.eyJhY3RvclR5cGUiOiJVU0VSIiwiYWN0b3JJZCI6InNlcnZpY2VfMDNkMTZjMTctZjFjNC00MGY0LThkNDAtNWYyM2JjZGUzZGYyIiwidHlwZSI6IlNFUlZJQ0VfQUNDT1VOVCIsInZlcnNpb24iOiIyIiwianRpIjoiNTIxMTExNzQtMTgzYS00MmQ4LWI4YTEtMjdmY2ZiMDk0OGE5Iiwic3ViIjoic2VydmljZV8wM2QxNmMxNy1mMWM0LTQwZjQtOGQ0MC01ZjIzYmNkZTNkZjIiLCJpc3MiOiJkYXRhaHViLW1ldGFkYXRhLXNlcnZpY2UifQ.cb15MFr88gDERo_7d6jceEhaccTZXZKEdoa8IGC4cwQ")
 DATAHUB_GMS_URL = _var("DATAHUB_GMS_URL", "http://datahub-datahub-gms.datahub-tenant.svc.cluster.local:8080")
 SUPERSET_DASHBOARD_URL = _var(
     "fraud__superset_dashboard_url",
@@ -741,6 +742,7 @@ def _emit_lineage(**context):
                       {"urn": urn, "aspects": [
                           {"com.linkedin.common.Status": {"removed": False}}
                       ]}}}},
+                headers=headers,
                 timeout=15,
             )
             # this is the line that actually catches a 404/400/500
