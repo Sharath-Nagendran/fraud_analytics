@@ -724,44 +724,51 @@ def _publish_dashboard_link(**context):
 
 def _emit_lineage(**context):
     """
-    Lightweight DataHub REST emit via the legacy snapshot-ingest endpoint
-    (kept as plain requests.post rather than the acryl-datahub SDK -- the
-    SDK needs to be baked into the worker image, which has been unreliable
-    in this environment; revisit once that's sorted out). Deliberately
-    non-fatal: lineage cataloging shouldn't take down a production run.
+    Lightweight DataHub REST emit via the legacy snapshot-ingest endpoint.
+    Sends Status + DatasetProperties + BrowsePaths + UpstreamLineage per
+    dataset, wiring transactions -> fraud_transactions_curated ->
+    gold_daily_channel_city to match the actual pipeline flow.
     """
-    datasets = [
-        # (urn, platform, name, description)
-        ("urn:li:dataset:(urn:li:dataPlatform:file,fraud_demo.transactions,PROD)",
-         "file", "transactions", "Raw fraud transaction events (Kafka-sourced)."),
-        ("urn:li:dataset:(urn:li:dataPlatform:postgres,fraud_demo.fraud_transactions_curated,PROD)",
-         "postgres", "fraud_transactions_curated", "Curated/enriched transactions loaded by the fraud pipeline."),
-        ("urn:li:dataset:(urn:li:dataPlatform:clickhouse,fraud_demo.gold_daily_channel_city,PROD)",
-         "clickhouse", "gold_daily_channel_city", "Daily fraud aggregate by channel/city, serves the Superset dashboard."),
-    ]
-    headers = {"Authorization": f"Bearer {DATAHUB_TOKEN}"} if DATAHUB_TOKEN else {}
+    now_ms = int(time.time() * 1000)
+    actor = "urn:li:corpuser:airflow"
 
+    TXN_URN = "urn:li:dataset:(urn:li:dataPlatform:file,fraud_demo.transactions,PROD)"
+    CURATED_URN = "urn:li:dataset:(urn:li:dataPlatform:postgres,fraud_demo.fraud_transactions_curated,PROD)"
+    GOLD_URN = "urn:li:dataset:(urn:li:dataPlatform:clickhouse,fraud_demo.gold_daily_channel_city,PROD)"
+
+    def upstream(urn, lineage_type="TRANSFORMED"):
+        return {"auditStamp": {"time": now_ms, "actor": actor}, "dataset": urn, "type": lineage_type}
+
+    # (urn, platform, name, description, upstream_urns)
+    datasets = [
+        (TXN_URN, "file", "transactions", "Raw fraud transaction events (Kafka-sourced).", []),
+        (CURATED_URN, "postgres", "fraud_transactions_curated",
+         "Curated/enriched transactions loaded by the fraud pipeline.", [TXN_URN]),
+        (GOLD_URN, "clickhouse", "gold_daily_channel_city",
+         "Daily fraud aggregate by channel/city, serves the Superset dashboard.", [CURATED_URN]),
+    ]
+
+    headers = {"Authorization": f"Bearer {DATAHUB_TOKEN}"} if DATAHUB_TOKEN else {}
     ok, failed = [], []
-    for urn, platform, name, description in datasets:
+    for urn, platform, name, description, upstream_urns in datasets:
         aspects = [
             {"com.linkedin.common.Status": {"removed": False}},
             {"com.linkedin.dataset.DatasetProperties": {
-                "name": name,
-                "description": description,
+                "name": name, "description": description,
                 "customProperties": {"pipeline": "fraud_analytics_demo_pipeline"},
             }},
-            {"com.linkedin.common.BrowsePaths": {
-                "paths": [f"/prod/{platform}/fraud_demo"],
-            }},
+            {"com.linkedin.common.BrowsePaths": {"paths": [f"/prod/{platform}/fraud_demo"]}},
         ]
+        if upstream_urns:
+            aspects.append({"com.linkedin.dataset.UpstreamLineage": {
+                "upstreams": [upstream(u) for u in upstream_urns]
+            }})
         try:
-            logger.info("Issue POST request")
             resp = requests.post(
                 f"{DATAHUB_GMS_URL}/entities?action=ingest",
                 json={"entity": {"value": {"com.linkedin.metadata.snapshot.DatasetSnapshot":
                       {"urn": urn, "aspects": aspects}}}},
-                headers=headers,
-                timeout=15,
+                headers=headers, timeout=15,
             )
             resp.raise_for_status()
             logger.info("DataHub ingest OK urn=%s status=%s", urn, resp.status_code)
@@ -771,9 +778,6 @@ def _emit_lineage(**context):
             logger.error("DataHub ingest FAILED urn=%s error=%s response_body=%s", urn, exc, body)
             failed.append(urn)
 
-    logger.info("DataHub lineage emit: %d/%d succeeded (%s)", len(ok), len(datasets),
-                "all ok" if not failed else f"failed={failed}")
-  
     logger.info("DataHub lineage emit: %d/%d succeeded (%s)", len(ok), len(datasets),
                 "all ok" if not failed else f"failed={failed}")
 
