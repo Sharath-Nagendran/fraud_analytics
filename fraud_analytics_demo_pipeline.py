@@ -16,7 +16,7 @@ Actual topology, confirmed from app/main.py, app/services/job_service.py,
 app/services/spark_service.py and spark_executor_server.py:
 
   Airflow --HTTP--> spark-job-api (FastAPI, builds the spark-submit
-                     command AND executes it via a call to spark-client;
+                     command AND executes it via a call to sparkf-client;
                      it is not a passive command-builder as previously
                      assumed) --HTTP--> spark-client (runs the command
                      with subprocess.run, shell=True, blocking up to a
@@ -724,38 +724,55 @@ def _publish_dashboard_link(**context):
 
 def _emit_lineage(**context):
     """
-    Lightweight DataHub REST emit. Deliberately non-fatal: lineage
-    cataloging shouldn't take down a production run if DataHub is
-    unreachable, but we do log loudly so it's visible in monitoring.
+    Lightweight DataHub REST emit via the legacy snapshot-ingest endpoint
+    (kept as plain requests.post rather than the acryl-datahub SDK -- the
+    SDK needs to be baked into the worker image, which has been unreliable
+    in this environment; revisit once that's sorted out). Deliberately
+    non-fatal: lineage cataloging shouldn't take down a production run.
     """
     datasets = [
-        "urn:li:dataset:(urn:li:dataPlatform:file,fraud_demo.transactions,PROD)",
-        "urn:li:dataset:(urn:li:dataPlatform:postgres,fraud_demo.fraud_transactions_curated,PROD)",
-        "urn:li:dataset:(urn:li:dataPlatform:clickhouse,fraud_demo.gold_daily_channel_city,PROD)",
+        # (urn, platform, name, description)
+        ("urn:li:dataset:(urn:li:dataPlatform:file,fraud_demo.transactions,PROD)",
+         "file", "transactions", "Raw fraud transaction events (Kafka-sourced)."),
+        ("urn:li:dataset:(urn:li:dataPlatform:postgres,fraud_demo.fraud_transactions_curated,PROD)",
+         "postgres", "fraud_transactions_curated", "Curated/enriched transactions loaded by the fraud pipeline."),
+        ("urn:li:dataset:(urn:li:dataPlatform:clickhouse,fraud_demo.gold_daily_channel_city,PROD)",
+         "clickhouse", "gold_daily_channel_city", "Daily fraud aggregate by channel/city, serves the Superset dashboard."),
     ]
     headers = {"Authorization": f"Bearer {DATAHUB_TOKEN}"} if DATAHUB_TOKEN else {}
 
     ok, failed = [], []
-    for urn in datasets:
+    for urn, platform, name, description in datasets:
+        aspects = [
+            {"com.linkedin.common.Status": {"removed": False}},
+            {"com.linkedin.dataset.DatasetProperties": {
+                "name": name,
+                "description": description,
+                "customProperties": {"pipeline": "fraud_analytics_demo_pipeline"},
+            }},
+            {"com.linkedin.common.BrowsePaths": {
+                "paths": [f"/prod/{platform}/fraud_demo"],
+            }},
+        ]
         try:
             resp = requests.post(
                 f"{DATAHUB_GMS_URL}/entities?action=ingest",
                 json={"entity": {"value": {"com.linkedin.metadata.snapshot.DatasetSnapshot":
-                      {"urn": urn, "aspects": [
-                          {"com.linkedin.common.Status": {"removed": False}}
-                      ]}}}},
+                      {"urn": urn, "aspects": aspects}}}},
                 headers=headers,
                 timeout=15,
             )
-            # this is the line that actually catches a 404/400/500
             resp.raise_for_status()
-            logger.info("DataHub ingest OK urn=%s status=%s body=%s", urn, resp.status_code, resp.text[:300])
+            logger.info("DataHub ingest OK urn=%s status=%s", urn, resp.status_code)
             ok.append(urn)
         except requests.exceptions.RequestException as exc:
-            body = getattr(exc.response, "text", "")[:300] if getattr(exc, "response", None) else ""
+            body = getattr(exc.response, "text", "")[:500] if getattr(exc, "response", None) else ""
             logger.error("DataHub ingest FAILED urn=%s error=%s response_body=%s", urn, exc, body)
             failed.append(urn)
 
+    logger.info("DataHub lineage emit: %d/%d succeeded (%s)", len(ok), len(datasets),
+                "all ok" if not failed else f"failed={failed}")
+  
     logger.info("DataHub lineage emit: %d/%d succeeded (%s)", len(ok), len(datasets),
                 "all ok" if not failed else f"failed={failed}")
 
