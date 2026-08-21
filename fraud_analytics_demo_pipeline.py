@@ -733,6 +733,8 @@ def _emit_lineage(**context):
         "urn:li:dataset:(urn:li:dataPlatform:postgres,fraud_demo.fraud_transactions_curated,PROD)",
         "urn:li:dataset:(urn:li:dataPlatform:clickhouse,fraud_demo.gold_daily_channel_city,PROD)",
     ]
+    headers = {"Authorization": f"Bearer {DATAHUB_TOKEN}"} if DATAHUB_TOKEN else {}
+
     ok, failed = [], []
     for urn in datasets:
         try:
