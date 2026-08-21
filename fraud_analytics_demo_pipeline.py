@@ -755,6 +755,7 @@ def _emit_lineage(**context):
             }},
         ]
         try:
+            logger.info("Issue POST request")
             resp = requests.post(
                 f"{DATAHUB_GMS_URL}/entities?action=ingest",
                 json={"entity": {"value": {"com.linkedin.metadata.snapshot.DatasetSnapshot":
