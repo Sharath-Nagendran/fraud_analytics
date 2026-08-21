@@ -721,7 +721,6 @@ def _refresh_clickhouse_gold(**context):
 def _publish_dashboard_link(**context):
     logger.info("Superset dashboard: %s", SUPERSET_DASHBOARD_URL)
 
-
 def _emit_lineage(**context):
     """
     Lightweight DataHub REST emit. Deliberately non-fatal: lineage
@@ -733,18 +732,28 @@ def _emit_lineage(**context):
         "urn:li:dataset:(urn:li:dataPlatform:postgres,fraud_demo.fraud_transactions_curated,PROD)",
         "urn:li:dataset:(urn:li:dataPlatform:clickhouse,fraud_demo.gold_daily_channel_city,PROD)",
     ]
-    try:
-        for urn in datasets:
-            requests.post(
+    ok, failed = [], []
+    for urn in datasets:
+        try:
+            resp = requests.post(
                 f"{DATAHUB_GMS_URL}/entities?action=ingest",
                 json={"entity": {"value": {"com.linkedin.metadata.snapshot.DatasetSnapshot":
-                      {"urn": urn, "aspects": []}}}},
+                      {"urn": urn, "aspects": [
+                          {"com.linkedin.common.Status": {"removed": False}}
+                      ]}}}},
                 timeout=15,
             )
-        logger.info("Emitted lineage for %d datasets to DataHub", len(datasets))
-    except Exception as exc:
-        logger.error("DataHub lineage emit failed (non-fatal): %s", exc)
+            # this is the line that actually catches a 404/400/500
+            resp.raise_for_status()
+            logger.info("DataHub ingest OK urn=%s status=%s body=%s", urn, resp.status_code, resp.text[:300])
+            ok.append(urn)
+        except requests.exceptions.RequestException as exc:
+            body = getattr(exc.response, "text", "")[:300] if getattr(exc, "response", None) else ""
+            logger.error("DataHub ingest FAILED urn=%s error=%s response_body=%s", urn, exc, body)
+            failed.append(urn)
 
+    logger.info("DataHub lineage emit: %d/%d succeeded (%s)", len(ok), len(datasets),
+                "all ok" if not failed else f"failed={failed}")
 
 # ============================================================
 # DAG
