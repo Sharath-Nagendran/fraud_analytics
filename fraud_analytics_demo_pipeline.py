@@ -211,12 +211,74 @@ SPARK_SQL_HTTP_TIMEOUT = int(_var("fraud__spark_sql_http_timeout_sec", "320"))
 SPARK_JOB_POLL_INTERVAL = int(_var("fraud__spark_job_poll_interval_sec", "10"))
 SPARK_JOB_POLL_TIMEOUT = int(_var("fraud__spark_job_poll_timeout_sec", "1800"))
 
+_TYPE_MAP = {"string": "StringType", "number": "NumberType", "time": "TimeType", "date": "DateType"}
+OWNER_URN = "urn:li:corpuser:datahub"  # swap for the real airflow service-account URN once confirmed
 DATAHUB_TOKEN = _var("DATAHUB_GMS_TOKEN", "eyJhbGciOiJIUzI1NiJ9.eyJhY3RvclR5cGUiOiJVU0VSIiwiYWN0b3JJZCI6InNlcnZpY2VfMDNkMTZjMTctZjFjNC00MGY0LThkNDAtNWYyM2JjZGUzZGYyIiwidHlwZSI6IlNFUlZJQ0VfQUNDT1VOVCIsInZlcnNpb24iOiIyIiwianRpIjoiNTIxMTExNzQtMTgzYS00MmQ4LWI4YTEtMjdmY2ZiMDk0OGE5Iiwic3ViIjoic2VydmljZV8wM2QxNmMxNy1mMWM0LTQwZjQtOGQ0MC01ZjIzYmNkZTNkZjIiLCJpc3MiOiJkYXRhaHViLW1ldGFkYXRhLXNlcnZpY2UifQ.cb15MFr88gDERo_7d6jceEhaccTZXZKEdoa8IGC4cwQ")
 DATAHUB_GMS_URL = _var("DATAHUB_GMS_URL", "http://datahub-datahub-gms.datahub-tenant.svc.cluster.local:8080")
 SUPERSET_DASHBOARD_URL = _var(
     "fraud__superset_dashboard_url",
     "http://superset.superset-tenant-a.svc.cluster.local:8088/superset/dashboard/fraud_demo/",
 )
+def _schema_field(field_path, kind, native_type, description, nullable=False):
+    return {
+        "fieldPath": field_path,
+        "nullable": nullable,
+        "description": description,
+        "type": {"type": {f"com.linkedin.schema.{_TYPE_MAP[kind]}": {}}},
+        "nativeDataType": native_type,
+    }
+
+SCHEMA_FIELDS = {
+    "transactions": [
+        ("transaction_id", "string", "TEXT", "Unique transaction identifier"),
+        ("transaction_ts", "time", "TIMESTAMP", "Transaction timestamp"),
+        ("customer_id", "string", "TEXT", "Customer identifier"),
+        ("channel", "string", "TEXT", "Payment channel (UPI/NEFT/POS/ATM/IMPS/CARD)"),
+        ("amount_inr", "number", "NUMERIC", "Transaction amount in INR"),
+        ("merchant_id", "string", "TEXT", "Merchant identifier", True),
+        ("merchant_category", "string", "TEXT", "Merchant category", True),
+        ("city", "string", "TEXT", "Merchant city", True),
+        ("device_trust_status", "string", "TEXT", "Trusted / Known / New", True),
+        ("distance_from_home_km", "number", "FLOAT", "Distance from customer's home", True),
+        ("is_fraud", "number", "INT", "Fraud label: 1=fraud, 0=legitimate"),
+    ],
+    "fraud_transactions_curated": [
+        ("transaction_id", "string", "TEXT", "Primary key"),
+        ("transaction_ts", "time", "TIMESTAMP", "Transaction timestamp"),
+        ("customer_id", "string", "TEXT", "Customer identifier"),
+        ("channel", "string", "TEXT", "Payment channel"),
+        ("amount_inr", "number", "NUMERIC", "Transaction amount in INR"),
+        ("merchant_id", "string", "TEXT", "Merchant identifier", True),
+        ("merchant_category", "string", "TEXT", "Merchant category", True),
+        ("city", "string", "TEXT", "Merchant city", True),
+        ("device_trust_status", "string", "TEXT", "Trusted / Known / New", True),
+        ("is_fraud", "number", "INT", "Fraud label: 1=fraud, 0=legitimate"),
+        ("load_date", "date", "DATE", "Date this row was last upserted"),
+    ],
+    "gold_daily_channel_city": [
+        ("business_date", "date", "Date", "Aggregation date"),
+        ("channel", "string", "LowCardinality(String)", "Payment channel"),
+        ("city", "string", "LowCardinality(String)", "Merchant city"),
+        ("transaction_count", "number", "UInt32", "Total transactions"),
+        ("transaction_amount_inr", "number", "Float64", "Total transaction amount"),
+        ("fraud_count", "number", "UInt32", "Total fraud-labeled transactions"),
+        ("fraud_amount_inr", "number", "Float64", "Total amount flagged as fraud"),
+        ("fraud_rate_pct", "number", "Float32", "Fraud rate percentage"),
+        ("loaded_at", "time", "DateTime", "Row load timestamp (ReplacingMergeTree version col)"),
+    ],
+}
+
+def _schema_metadata_aspect(schema_name, platform, fields, actor, now_ms):
+    return {"com.linkedin.schema.SchemaMetadata": {
+        "schemaName": schema_name,
+        "platform": f"urn:li:dataPlatform:{platform}",
+        "version": 0,
+        "created": {"time": now_ms, "actor": actor},
+        "lastModified": {"time": now_ms, "actor": actor},
+        "hash": "",
+        "platformSchema": {"com.linkedin.schema.OtherSchema": {"rawSchema": ""}},
+        "fields": [_schema_field(*f) for f in fields],
+    }}
 
 SEED = 42
 DEFAULT_MIN_RECALL = 0.60
@@ -747,6 +809,7 @@ def _emit_lineage(**context):
         (GOLD_URN, "clickhouse", "gold_daily_channel_city",
          "Daily fraud aggregate by channel/city, serves the Superset dashboard.", [CURATED_URN]),
     ]
+    now_ms = int(time.time() * 1000)
 
     headers = {"Authorization": f"Bearer {DATAHUB_TOKEN}"} if DATAHUB_TOKEN else {}
     ok, failed = [], []
@@ -758,6 +821,11 @@ def _emit_lineage(**context):
                 "customProperties": {"pipeline": "fraud_analytics_demo_pipeline"},
             }},
             {"com.linkedin.common.BrowsePaths": {"paths": [f"/prod/{platform}/fraud_demo"]}},
+            {"com.linkedin.common.Ownership": {
+                "owners": [{"owner": OWNER_URN, "type": "TECHNICAL_OWNER"}],
+                "lastModified": {"time": now_ms, "actor": OWNER_URN},
+            }},
+            _schema_metadata_aspect(name, platform, SCHEMA_FIELDS[name], OWNER_URN, now_ms),
         ]
         if upstream_urns:
             aspects.append({"com.linkedin.dataset.UpstreamLineage": {
