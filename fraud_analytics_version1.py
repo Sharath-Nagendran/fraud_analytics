@@ -304,6 +304,33 @@ _FAILURE_STATES = {"FAILED", "ERROR", "CANCELLED"}
 _NON_TERMINAL_STATES = {"SUBMITTED", "RUNNING", "PENDING"}
 
 
+import time
+
+def _wait_for_file(filepath, max_retries=5, backoff_seconds=2):
+    """
+    Wait for a file to exist and be readable, with exponential backoff.
+    Handles PVC eventual-consistency issues on shared storage.
+    """
+    for attempt in range(max_retries):
+        if os.path.exists(filepath):
+            try:
+                # Try to actually read a byte to confirm it's written
+                with open(filepath, 'rb') as f:
+                    f.read(1)
+                logger.info(f"File {filepath} confirmed readable after {attempt} attempts")
+                return
+            except (IOError, OSError) as e:
+                logger.warning(f"File {filepath} exists but not yet readable (attempt {attempt+1}): {e}")
+        else:
+            logger.warning(f"File {filepath} not found yet (attempt {attempt+1}/{max_retries})")
+        
+        if attempt < max_retries - 1:
+            sleep_time = backoff_seconds * (2 ** attempt)  # exponential backoff: 2s, 4s, 8s, 16s, 32s
+            logger.info(f"Waiting {sleep_time}s before retry...")
+            time.sleep(sleep_time)
+        else:
+            raise AirflowException(f"File {filepath} never became readable after {max_retries} attempts")
+
 def _submit_jar_job(name: str, artifact_path: str, entry_point: str, job_args=None) -> str:
     """
     POST /jobs/submit. job_type is hardcoded to "jar" -- the schema also
@@ -506,6 +533,7 @@ def _load_demo_data(**context):
 
 
 def _validate_data(**context):
+    _wait_for_file(os.path.join(STAGING_DIR, "transactions.parquet"))
     txn = pd.read_parquet(os.path.join(STAGING_DIR, "transactions.parquet"))
     customers = pd.read_parquet(os.path.join(STAGING_DIR, "customers.parquet"))
 
@@ -532,6 +560,7 @@ def _validate_data(**context):
 
 
 def _engineer_features(**context):
+    _wait_for_file(os.path.join(STAGING_DIR, "transactions.parquet"))
     txn = pd.read_parquet(os.path.join(STAGING_DIR, "transactions.parquet"))
     txn["transaction_ts"] = pd.to_datetime(txn["transaction_ts"])
 
@@ -599,6 +628,7 @@ def _train_or_score_model(**context):
         return
 
     # ---- default path: in-process training, no Spark/JAR dependency ----
+    _wait_for_file(os.path.join(STAGING_DIR, "transactions_features.parquet"))
     df = pd.read_parquet(os.path.join(STAGING_DIR, "transactions_features.parquet"))
     feature_cols = [c for c in [
         "amount_inr", "log_amount", "txn_count_1h", "unusual_hour_flag", "distance_from_home_km",
@@ -688,7 +718,7 @@ def _load_curated_postgres(**context):
 
     pg = _conn_or_env("fraud_postgres_default", "MY_POSTGRES_HOST", "MY_POSTGRES_PORT",
                        "MY_POSTGRES_USER", "MY_POSTGRES_PASSWORD", "MY_POSTGRES_DB", 5432, "data_warehouse")
-
+    _wait_for_file(os.path.join(STAGING_DIR, "transactions_features.parquet"))
     txn = pd.read_parquet(os.path.join(STAGING_DIR, "transactions_features.parquet"))
     cols = [c for c in ["transaction_id", "transaction_ts", "customer_id", "channel", "amount_inr",
                          "merchant_id", "merchant_category", "city", "device_trust_status", "is_fraud"]
@@ -744,7 +774,7 @@ def _refresh_clickhouse_gold(**context):
         ch = {"host": host, "port": int(os.getenv("CLICKHOUSE_PORT", "8123")),
               "user": os.getenv("CLICKHOUSE_USER", "default"),
               "password": os.getenv("CLICKHOUSE_PASSWORD", ""), "db": os.getenv("CLICKHOUSE_DB", CLICKHOUSE_DB)}
-
+    _wait_for_file(os.path.join(STAGING_DIR, "transactions_features.parquet"))
     txn = pd.read_parquet(os.path.join(STAGING_DIR, "transactions_features.parquet"))
     txn["transaction_ts"] = pd.to_datetime(txn["transaction_ts"])
     txn["business_date"] = txn["transaction_ts"].dt.date
