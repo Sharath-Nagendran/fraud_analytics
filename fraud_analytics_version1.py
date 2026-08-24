@@ -867,7 +867,7 @@ if Param is not None:
     }
 
 with DAG(
-    dag_id="fraud_analytics_demo_pipeline",
+    dag_id="fraud_analytics_version1",
     default_args=default_args,
     description="Fraud analytics: ingest -> validate -> engineer -> train/score -> evaluate -> "
                  "promote -> curate -> serve -> lineage",
