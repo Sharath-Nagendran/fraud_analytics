@@ -1,12 +1,49 @@
 """
 fraud_analytics_demo_pipeline.py
 
-Production-grade fraud analytics pipeline: ingest -> validate -> engineer
-features -> train/score -> evaluate quality gate -> promote -> load curated
-Postgres -> refresh ClickHouse gold tables -> refresh dashboard + emit
-lineage. Built from the Fraud_Analytics_Demo_Pack_v2 data and designed to
-be triggered from the unified management portal via DAG run `conf` /
-Airflow `params` (see the `params=` block at the bottom).
+Production-grade fraud analytics pipeline: ingest -> publish/consume via
+Kafka -> validate -> engineer features -> train/score -> evaluate quality
+gate -> promote -> load curated Postgres -> refresh ClickHouse gold
+tables -> refresh dashboard + emit lineage. Built from the
+Fraud_Analytics_Demo_Pack_v2 data and designed to be triggered from the
+unified management portal via DAG run `conf` / Airflow `params` (see the
+`params=` block at the bottom).
+
+===========================================================================
+PHASE 1 ADDITION -- KAFKA INGESTION (see fraud__use_kafka_ingestion)
+===========================================================================
+Transactions now flow through a real Kafka topic (fraud.transactions.raw)
+instead of being read directly from the staged parquet file:
+
+  load_transaction_data (writes transactions_source.parquet, as before)
+    -> produce_transactions_to_kafka (publishes each row to Kafka)
+    -> consume_transactions_from_kafka (reads it back -> transactions.parquet)
+    -> validate_transaction_data (unchanged downstream)
+
+IMPORTANT CONSTRAINT: this is intentionally a *bounded batch* consume, not
+a long-running Spark Structured Streaming job. spark-job-api's /jobs/submit
+runs with deploy-mode=cluster and waitAppCompletion=true, blocking the HTTP
+call for the job's lifetime up to a hardcoded 600s timeout (see the
+SPARK INTEGRATION section below) -- a genuinely long-running streaming
+consumer would simply get killed at that timeout. So Kafka consumption
+here is done natively in Airflow (kafka-python), as a bounded read with an
+idle timeout, inside the existing @daily batch DAG. This is still real
+pub/sub over a real broker -- just not 24/7 streaming, which the current
+platform cannot run.
+
+Each DAG run uses a fresh consumer group (`airflow-fraud-consumer-<run_id>`)
+with `auto_offset_reset=earliest`, so it always reads exactly what this
+run's produce task just published, independent of prior runs' offsets. A
+real continuous-ingestion service would instead use a stable group_id and
+committed offsets -- that's a reasonable Phase 1.5 once there's an actual
+upstream producer other than this DAG (e.g. a transaction-origination
+service publishing directly).
+
+`fraud__use_kafka_ingestion` defaults to "true". Setting it to "false"
+skips Kafka entirely and copies transactions_source.parquet straight to
+transactions.parquet, matching the same rollback pattern already used for
+`fraud__use_spark_job_api`.
+===========================================================================
 
 ===========================================================================
 SPARK INTEGRATION -- REWRITTEN AGAINST THE REAL spark_job_api / spark_client
@@ -43,7 +80,9 @@ Two real endpoints matter to us:
       training job that takes longer than ~10 minutes will time out at
       the HTTP layer even though the underlying Spark app may still be
       running on the cluster. There is no way around this from the
-      Airflow side except keeping training jobs under ~9 minutes.
+      Airflow side except keeping training jobs under ~9 minutes. This is
+      also why Kafka consumption (above) is done natively in Airflow
+      instead of via a Spark Structured Streaming job through this API.
 
   GET /jobs/{job_id}  -> {"job_id", "status", "created_at"}
       `status` is refreshed by a background thread (job_service's
@@ -198,6 +237,13 @@ CSV_FILES = ["customers.csv", "accounts.csv", "devices.csv", "merchants.csv",
 
 CLICKHOUSE_DB = _var("fraud__clickhouse_db", "fraud_demo")
 
+# ---- Kafka ingestion (Phase 1 -- see module docstring) ----
+KAFKA_BOOTSTRAP_SERVERS = _var("KAFKA_BOOTSTRAP_SERVERS", "kafka.data-platform.svc.cluster.local:9092")
+KAFKA_TOPIC_TRANSACTIONS = _var("fraud__kafka_topic_transactions", "fraud.transactions.raw")
+KAFKA_CONSUME_IDLE_TIMEOUT_MS = int(_var("fraud__kafka_consume_idle_timeout_ms", "8000"))
+KAFKA_PRODUCE_BATCH_SIZE = int(_var("fraud__kafka_produce_batch_size", "500"))
+USE_KAFKA_INGESTION = str(_var("fraud__use_kafka_ingestion", "true")).lower() == "true"
+
 # ---- spark-job-api (see module docstring for the real contract) ----
 SPARK_JOB_API_URL = _var("SPARK_JOB_API_URL", "http://jobapi.data-platform.tcs.private.cloud")
 USE_SPARK_JOB_API = str(_var("fraud__use_spark_job_api", "false")).lower() == "true"
@@ -229,7 +275,7 @@ def _schema_field(field_path, kind, native_type, description, nullable=False):
     }
 
 SCHEMA_FIELDS = {
-    "transactions": [
+    "transactions.raw": [
         ("transaction_id", "string", "TEXT", "Unique transaction identifier"),
         ("transaction_ts", "time", "TIMESTAMP", "Transaction timestamp"),
         ("customer_id", "string", "TEXT", "Customer identifier"),
@@ -297,6 +343,120 @@ default_args = {
 
 
 # ============================================================
+# Kafka ingestion (Phase 1)
+# ============================================================
+def _produce_transactions_to_kafka(**context):
+    """
+    Publishes each row of transactions_source.parquet to the Kafka topic
+    fraud.transactions.raw, keyed by transaction_id. This simulates the
+    role a real transaction-origination system would play in production
+    -- the producer API used here is the same one a real system would
+    call, so swapping this task out for an external producer later is a
+    config change, not a rearchitecture.
+    """
+    if not USE_KAFKA_INGESTION:
+        logger.info("fraud__use_kafka_ingestion is false -- skipping Kafka produce.")
+        return
+
+    from kafka import KafkaProducer
+
+    src_path = os.path.join(STAGING_DIR, "transactions_source.parquet")
+    txn = pd.read_parquet(src_path)
+    if txn.empty:
+        raise AirflowException("No transactions to publish -- transactions_source.parquet is empty.")
+
+    txn = txn.copy()
+    txn["transaction_ts"] = txn["transaction_ts"].astype(str)  # JSON needs a plain string, not a Timestamp
+
+    producer = KafkaProducer(
+        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS.split(","),
+        value_serializer=lambda v: json.dumps(v, default=str).encode("utf-8"),
+        key_serializer=lambda k: k.encode("utf-8") if k else None,
+        acks="all",
+        retries=3,
+        linger_ms=50,
+    )
+    sent = 0
+    try:
+        for record in txn.to_dict(orient="records"):
+            producer.send(KAFKA_TOPIC_TRANSACTIONS, key=record.get("transaction_id"), value=record)
+            sent += 1
+            if sent % KAFKA_PRODUCE_BATCH_SIZE == 0:
+                producer.flush()
+                logger.info("Published %d/%d transactions to Kafka topic %s",
+                            sent, len(txn), KAFKA_TOPIC_TRANSACTIONS)
+        producer.flush()
+    finally:
+        producer.close()
+
+    logger.info("Published %d transactions to Kafka topic %s", sent, KAFKA_TOPIC_TRANSACTIONS)
+    context["ti"].xcom_push(key="kafka_produced_count", value=sent)
+
+
+def _consume_transactions_from_kafka(**context):
+    """
+    Reads fraud.transactions.raw back out as a bounded batch (not a
+    long-running stream -- see module docstring) and writes
+    transactions.parquet, the same file downstream tasks already expect.
+    Uses a fresh consumer group per DAG run so it always reads exactly
+    what this run's produce task just published, regardless of prior
+    runs' committed offsets.
+    """
+    if not USE_KAFKA_INGESTION:
+        import shutil
+        shutil.copyfile(
+            os.path.join(STAGING_DIR, "transactions_source.parquet"),
+            os.path.join(STAGING_DIR, "transactions.parquet"),
+        )
+        logger.info("fraud__use_kafka_ingestion is false -- copied transactions_source.parquet directly.")
+        return
+
+    from kafka import KafkaConsumer
+
+    produced_count = context["ti"].xcom_pull(
+        task_ids="ingestion.produce_transactions_to_kafka", key="kafka_produced_count") or 0
+
+    group_id = f"airflow-fraud-consumer-{context['run_id']}"
+    consumer = KafkaConsumer(
+        KAFKA_TOPIC_TRANSACTIONS,
+        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS.split(","),
+        group_id=group_id,
+        auto_offset_reset="earliest",
+        enable_auto_commit=False,
+        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+        consumer_timeout_ms=KAFKA_CONSUME_IDLE_TIMEOUT_MS,
+    )
+
+    records = []
+    try:
+        for message in consumer:
+            records.append(message.value)
+            if produced_count and len(records) >= produced_count:
+                break
+        consumer.commit()
+    finally:
+        consumer.close()
+
+    if not records:
+        raise AirflowException(
+            f"Consumed 0 messages from Kafka topic {KAFKA_TOPIC_TRANSACTIONS} -- check that the "
+            f"produce task succeeded and KAFKA_BOOTSTRAP_SERVERS is correct."
+        )
+    if produced_count and len(records) < produced_count:
+        logger.warning(
+            "Consumed %d/%d expected messages before the %dms idle timeout -- proceeding with "
+            "what was received. If this happens consistently, raise fraud__kafka_consume_idle_timeout_ms.",
+            len(records), produced_count, KAFKA_CONSUME_IDLE_TIMEOUT_MS,
+        )
+
+    txn = pd.DataFrame(records)
+    txn["transaction_ts"] = pd.to_datetime(txn["transaction_ts"])
+    txn.to_parquet(os.path.join(STAGING_DIR, "transactions.parquet"), index=False)
+    logger.info("Consumed %d transactions from Kafka -> transactions.parquet", len(txn))
+    context["ti"].xcom_push(key="kafka_consumed_count", value=len(txn))
+
+
+# ============================================================
 # spark-job-api client (matches the REAL contract -- see docstring)
 # ============================================================
 _SUCCESS_STATES = {"SUCCESS", "SUCCEEDED", "COMPLETED"}  # bug #4: inconsistent strings, accept both
@@ -309,7 +469,7 @@ def _submit_jar_job(name: str, artifact_path: str, entry_point: str, job_args=No
     POST /jobs/submit. job_type is hardcoded to "jar" -- the schema also
     accepts "pyspark"/"scala" but only "jar" is an approved path today.
     artifact_path MUST be a plain, unauthenticated HTTP(S) URL; job-api
-    downloads it itself before re-uploading to HDFS.
+    downloads it itself before re-uploading it to HDFS.
 
     NOTE: because deploy-mode is "cluster" with waitAppCompletion=true
     (see docstring), this call blocks for the job's full runtime, up to
@@ -492,7 +652,12 @@ def _load_demo_data(**context):
 
     row_counts = {}
     for key, df in frames.items():
-        df.to_parquet(os.path.join(STAGING_DIR, f"{key}.parquet"), index=False)
+        # transactions is written as "_source" -- it now flows through
+        # Kafka before becoming transactions.parquet (see
+        # produce/consume_transactions_from_kafka below); every other
+        # dimension table is unchanged.
+        fname = "transactions_source.parquet" if key == "transactions" else f"{key}.parquet"
+        df.to_parquet(os.path.join(STAGING_DIR, fname), index=False)
         row_counts[key] = len(df)
 
     logger.info("Row counts (%s): %s", source, row_counts)
@@ -787,14 +952,15 @@ def _publish_dashboard_link(**context):
 def _emit_lineage(**context):
     """
     Lightweight DataHub REST emit via the legacy snapshot-ingest endpoint.
-    Sends Status + DatasetProperties + BrowsePaths + UpstreamLineage per
-    dataset, wiring transactions -> fraud_transactions_curated ->
-    gold_daily_channel_city to match the actual pipeline flow.
+    Sends Status + DatasetProperties + BrowsePaths + Ownership +
+    SchemaMetadata + UpstreamLineage per dataset, wiring
+    transactions.raw (Kafka) -> fraud_transactions_curated (Postgres) ->
+    gold_daily_channel_city (ClickHouse) to match the actual pipeline flow.
     """
     now_ms = int(time.time() * 1000)
     actor = "urn:li:corpuser:airflow"
 
-    TXN_URN = "urn:li:dataset:(urn:li:dataPlatform:file,fraud_demo.transactions,PROD)"
+    TXN_URN = f"urn:li:dataset:(urn:li:dataPlatform:kafka,{KAFKA_TOPIC_TRANSACTIONS},PROD)"
     CURATED_URN = "urn:li:dataset:(urn:li:dataPlatform:postgres,fraud_demo.fraud_transactions_curated,PROD)"
     GOLD_URN = "urn:li:dataset:(urn:li:dataPlatform:clickhouse,fraud_demo.gold_daily_channel_city,PROD)"
 
@@ -802,8 +968,10 @@ def _emit_lineage(**context):
         return {"auditStamp": {"time": now_ms, "actor": actor}, "dataset": urn, "type": lineage_type}
 
     # (urn, platform, name, description, upstream_urns)
+    # "name" doubles as the SCHEMA_FIELDS lookup key for each entity.
     datasets = [
-        (TXN_URN, "file", "transactions", "Raw fraud transaction events (Kafka-sourced).", []),
+        (TXN_URN, "kafka", "transactions.raw",
+         "Raw fraud transaction events published to Kafka topic fraud.transactions.raw.", []),
         (CURATED_URN, "postgres", "fraud_transactions_curated",
          "Curated/enriched transactions loaded by the fraud pipeline.", [TXN_URN]),
         (GOLD_URN, "clickhouse", "gold_daily_channel_city",
@@ -869,7 +1037,7 @@ if Param is not None:
 with DAG(
     dag_id="fraud_analytics_demo_pipeline",
     default_args=default_args,
-    description="Fraud analytics: ingest -> validate -> engineer -> train/score -> evaluate -> "
+    description="Fraud analytics: ingest -> Kafka -> validate -> engineer -> train/score -> evaluate -> "
                  "promote -> curate -> serve -> lineage",
     schedule="@daily",
     catchup=False,
@@ -882,9 +1050,13 @@ with DAG(
 
     with TaskGroup(group_id="ingestion") as ingestion:
         load_demo_data = PythonOperator(task_id="load_transaction_data", python_callable=_load_demo_data)
+        produce_to_kafka = PythonOperator(task_id="produce_transactions_to_kafka",
+                                           python_callable=_produce_transactions_to_kafka)
+        consume_from_kafka = PythonOperator(task_id="consume_transactions_from_kafka",
+                                             python_callable=_consume_transactions_from_kafka)
         validate_data = PythonOperator(task_id="validate_transaction_data", python_callable=_validate_data)
         engineer_features = PythonOperator(task_id="engineer_risk_features", python_callable=_engineer_features)
-        load_demo_data >> validate_data >> engineer_features
+        load_demo_data >> produce_to_kafka >> consume_from_kafka >> validate_data >> engineer_features
 
     with TaskGroup(group_id="modeling") as modeling:
         snapshot_via_spark_sql = PythonOperator(task_id="snapshot_iceberg_source_optional",
