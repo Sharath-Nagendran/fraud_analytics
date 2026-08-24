@@ -133,6 +133,49 @@ logger = logging.getLogger(__name__)
 # ============================================================
 USE_CASE = "fraud_analytics"
 
+import time
+import stat
+
+def _wait_for_file(filepath, max_retries=10, backoff_seconds=1, min_size_bytes=100):
+    """
+    Wait for a file to exist, be readable, and have a minimum size (not just touch).
+    Handles PVC eventual-consistency and incomplete writes.
+    """
+    for attempt in range(max_retries):
+        try:
+            if not os.path.exists(filepath):
+                logger.warning(f"File {filepath} not found yet (attempt {attempt+1}/{max_retries})")
+            else:
+                # File exists — check if it's readable and has content
+                file_size = os.path.getsize(filepath)
+                if file_size < min_size_bytes:
+                    logger.warning(f"File {filepath} exists but only {file_size} bytes (attempt {attempt+1}/{max_retries}, need >{min_size_bytes})")
+                else:
+                    # Try to actually read a chunk to confirm it's not truncated/corrupted
+                    with open(filepath, 'rb') as f:
+                        chunk = f.read(min(1024, file_size))
+                    logger.info(f"File {filepath} confirmed readable ({file_size} bytes) after {attempt} attempts")
+                    return
+        except (IOError, OSError) as e:
+            logger.warning(f"File {filepath} error (attempt {attempt+1}/{max_retries}): {e}")
+        
+        if attempt < max_retries - 1:
+            sleep_time = backoff_seconds * (2 ** attempt)  # exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s, 512s
+            logger.info(f"Waiting {sleep_time}s before retry...")
+            time.sleep(sleep_time)
+        else:
+            # One last diagnostic attempt
+            if os.path.exists(filepath):
+                try:
+                    file_size = os.path.getsize(filepath)
+                    file_stat = os.stat(filepath)
+                    logger.error(
+                        f"File {filepath} exists ({file_size} bytes) but never became readable. "
+                        f"Permissions: {oct(file_stat.st_mode)}, Owner: {file_stat.st_uid}:{file_stat.st_gid}"
+                    )
+                except Exception as diag_e:
+                    logger.error(f"File {filepath} exists but can't stat it: {diag_e}")
+            raise AirflowException(f"File {filepath} never became readable after {max_retries} attempts (checked size, permissions, and content)")
 
 def _var(key: str, default=None):
     """Airflow Variable, falling back to env var, falling back to default."""
@@ -304,32 +347,6 @@ _FAILURE_STATES = {"FAILED", "ERROR", "CANCELLED"}
 _NON_TERMINAL_STATES = {"SUBMITTED", "RUNNING", "PENDING"}
 
 
-import time
-
-def _wait_for_file(filepath, max_retries=5, backoff_seconds=2):
-    """
-    Wait for a file to exist and be readable, with exponential backoff.
-    Handles PVC eventual-consistency issues on shared storage.
-    """
-    for attempt in range(max_retries):
-        if os.path.exists(filepath):
-            try:
-                # Try to actually read a byte to confirm it's written
-                with open(filepath, 'rb') as f:
-                    f.read(1)
-                logger.info(f"File {filepath} confirmed readable after {attempt} attempts")
-                return
-            except (IOError, OSError) as e:
-                logger.warning(f"File {filepath} exists but not yet readable (attempt {attempt+1}): {e}")
-        else:
-            logger.warning(f"File {filepath} not found yet (attempt {attempt+1}/{max_retries})")
-        
-        if attempt < max_retries - 1:
-            sleep_time = backoff_seconds * (2 ** attempt)  # exponential backoff: 2s, 4s, 8s, 16s, 32s
-            logger.info(f"Waiting {sleep_time}s before retry...")
-            time.sleep(sleep_time)
-        else:
-            raise AirflowException(f"File {filepath} never became readable after {max_retries} attempts")
 
 def _submit_jar_job(name: str, artifact_path: str, entry_point: str, job_args=None) -> str:
     """
