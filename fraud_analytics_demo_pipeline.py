@@ -172,6 +172,51 @@ logger = logging.getLogger(__name__)
 # ============================================================
 USE_CASE = "fraud_analytics"
 
+import time
+import stat
+
+def _wait_for_file(filepath, max_retries=10, backoff_seconds=1, min_size_bytes=100):
+    """
+    Wait for a file to exist, be readable, and have a minimum size (not just touch).
+    Handles PVC eventual-consistency and incomplete writes.
+    """
+    for attempt in range(max_retries):
+        try:
+            if not os.path.exists(filepath):
+                logger.warning(f"File {filepath} not found yet (attempt {attempt+1}/{max_retries})")
+            else:
+                # File exists — check if it's readable and has content
+                file_size = os.path.getsize(filepath)
+                if file_size < min_size_bytes:
+                    logger.warning(f"File {filepath} exists but only {file_size} bytes (attempt {attempt+1}/{max_retries}, need >{min_size_bytes})")
+                else:
+                    # Try to actually read a chunk to confirm it's not truncated/corrupted
+                    with open(filepath, 'rb') as f:
+                        chunk = f.read(min(1024, file_size))
+                    logger.info(f"File {filepath} confirmed readable ({file_size} bytes) after {attempt} attempts")
+                    return
+        except (IOError, OSError) as e:
+            logger.warning(f"File {filepath} error (attempt {attempt+1}/{max_retries}): {e}")
+        
+        if attempt < max_retries - 1:
+            sleep_time = backoff_seconds * (2 ** attempt)  # exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s, 512s
+            logger.info(f"Waiting {sleep_time}s before retry...")
+            time.sleep(sleep_time)
+        else:
+            # One last diagnostic attempt
+            if os.path.exists(filepath):
+                try:
+                    file_size = os.path.getsize(filepath)
+                    file_stat = os.stat(filepath)
+                    logger.error(
+                        f"File {filepath} exists ({file_size} bytes) but never became readable. "
+                        f"Permissions: {oct(file_stat.st_mode)}, Owner: {file_stat.st_uid}:{file_stat.st_gid}"
+                    )
+                except Exception as diag_e:
+                    logger.error(f"File {filepath} exists but can't stat it: {diag_e}")
+            raise AirflowException(f"File {filepath} never became readable after {max_retries} attempts (checked size, permissions, and content)")
+
+
 
 def _var(key: str, default=None):
     """Airflow Variable, falling back to env var, falling back to default."""
@@ -671,6 +716,7 @@ def _load_demo_data(**context):
 
 
 def _validate_data(**context):
+    _wait_for_file(os.path.join(STAGING_DIR, "transactions.parquet"))
     txn = pd.read_parquet(os.path.join(STAGING_DIR, "transactions.parquet"))
     customers = pd.read_parquet(os.path.join(STAGING_DIR, "customers.parquet"))
 
@@ -697,6 +743,7 @@ def _validate_data(**context):
 
 
 def _engineer_features(**context):
+    _wait_for_file(os.path.join(STAGING_DIR, "transactions.parquet"))
     txn = pd.read_parquet(os.path.join(STAGING_DIR, "transactions.parquet"))
     txn["transaction_ts"] = pd.to_datetime(txn["transaction_ts"])
 
@@ -853,7 +900,7 @@ def _load_curated_postgres(**context):
 
     pg = _conn_or_env("fraud_postgres_default", "MY_POSTGRES_HOST", "MY_POSTGRES_PORT",
                        "MY_POSTGRES_USER", "MY_POSTGRES_PASSWORD", "MY_POSTGRES_DB", 5432, "data_warehouse")
-
+    _wait_for_file(os.path.join(STAGING_DIR, "transactions_features.parquet"))
     txn = pd.read_parquet(os.path.join(STAGING_DIR, "transactions_features.parquet"))
     cols = [c for c in ["transaction_id", "transaction_ts", "customer_id", "channel", "amount_inr",
                          "merchant_id", "merchant_category", "city", "device_trust_status", "is_fraud"]
@@ -909,7 +956,7 @@ def _refresh_clickhouse_gold(**context):
         ch = {"host": host, "port": int(os.getenv("CLICKHOUSE_PORT", "8123")),
               "user": os.getenv("CLICKHOUSE_USER", "default"),
               "password": os.getenv("CLICKHOUSE_PASSWORD", ""), "db": os.getenv("CLICKHOUSE_DB", CLICKHOUSE_DB)}
-
+    _wait_for_file(os.path.join(STAGING_DIR, "transactions_features.parquet"))
     txn = pd.read_parquet(os.path.join(STAGING_DIR, "transactions_features.parquet"))
     txn["transaction_ts"] = pd.to_datetime(txn["transaction_ts"])
     txn["business_date"] = txn["transaction_ts"].dt.date
