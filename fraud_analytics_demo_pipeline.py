@@ -821,6 +821,7 @@ def _train_or_score_model(**context):
         return
 
     # ---- default path: in-process training, no Spark/JAR dependency ----
+    _wait_for_file(os.path.join(STAGING_DIR,"transactions_features.parquet"))
     df = pd.read_parquet(os.path.join(STAGING_DIR, "transactions_features.parquet"))
     feature_cols = [c for c in [
         "amount_inr", "log_amount", "txn_count_1h", "unusual_hour_flag", "distance_from_home_km",
