@@ -403,8 +403,8 @@ def _produce_transactions_to_kafka(**context):
         logger.info("fraud__use_kafka_ingestion is false -- skipping Kafka produce.")
         return
 
-    from kafka import KafkaProducer
-
+    #from kafka import KafkaProducer
+    from confluent_kafka import Producer
     src_path = os.path.join(STAGING_DIR, "transactions_source.parquet")
     txn = pd.read_parquet(src_path)
     if txn.empty:
@@ -413,7 +413,7 @@ def _produce_transactions_to_kafka(**context):
     txn = txn.copy()
     txn["transaction_ts"] = txn["transaction_ts"].astype(str)  # JSON needs a plain string, not a Timestamp
 
-    producer = KafkaProducer(
+    producer = Producer(
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS.split(","),
         value_serializer=lambda v: json.dumps(v, default=str).encode("utf-8"),
         key_serializer=lambda k: k.encode("utf-8") if k else None,
@@ -456,13 +456,13 @@ def _consume_transactions_from_kafka(**context):
         logger.info("fraud__use_kafka_ingestion is false -- copied transactions_source.parquet directly.")
         return
 
-    from kafka import KafkaConsumer
+    from confluent_kafka import Consumer
 
     produced_count = context["ti"].xcom_pull(
         task_ids="ingestion.produce_transactions_to_kafka", key="kafka_produced_count") or 0
 
     group_id = f"airflow-fraud-consumer-{context['run_id']}"
-    consumer = KafkaConsumer(
+    consumer = Consumer(
         KAFKA_TOPIC_TRANSACTIONS,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS.split(","),
         group_id=group_id,
