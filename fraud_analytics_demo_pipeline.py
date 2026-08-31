@@ -467,7 +467,7 @@ def _consume_transactions_from_kafka(**context):
         task_ids="ingestion.produce_transactions_to_kafka", key="kafka_produced_count") or 0
 
     group_id = f"airflow-fraud-consumer-{context['run_id']}"
-    consumer = Consumer(
+    consumer = KafkaConsumer(
         KAFKA_TOPIC_TRANSACTIONS,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS.split(","),
         security_protocol="SASL_PLAINTEXT",
