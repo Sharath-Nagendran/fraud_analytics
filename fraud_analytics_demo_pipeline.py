@@ -466,7 +466,7 @@ def _consume_transactions_from_kafka(**context):
     produced_count = context["ti"].xcom_pull(
         task_ids="ingestion.produce_transactions_to_kafka", key="kafka_produced_count") or 0
 
-    group_id = f"airflow-fraud-consumer-{context['run_id']}"
+    group_id = f"data-platform-consumer-{context['run_id']}"
     consumer = KafkaConsumer(
         KAFKA_TOPIC_TRANSACTIONS,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS.split(","),
