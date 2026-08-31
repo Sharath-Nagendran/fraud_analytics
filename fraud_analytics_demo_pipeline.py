@@ -284,7 +284,7 @@ CLICKHOUSE_DB = _var("fraud__clickhouse_db", "fraud_demo")
 
 # ---- Kafka ingestion (Phase 1 -- see module docstring) ----
 KAFKA_BOOTSTRAP_SERVERS = _var("KAFKA_BOOTSTRAP_SERVERS", "kafka.data-platform.svc.cluster.local:9092")
-KAFKA_TOPIC_TRANSACTIONS = _var("fraud__kafka_topic_transactions", "fraud.transactions.raw")
+KAFKA_TOPIC_TRANSACTIONS = _var("fraud__kafka_topic_transactions", "data-platform-fraud.transactions.raw")
 KAFKA_CONSUME_IDLE_TIMEOUT_MS = int(_var("fraud__kafka_consume_idle_timeout_ms", "8000"))
 KAFKA_PRODUCE_BATCH_SIZE = int(_var("fraud__kafka_produce_batch_size", "500"))
 USE_KAFKA_INGESTION = str(_var("fraud__use_kafka_ingestion", "true")).lower() == "true"
