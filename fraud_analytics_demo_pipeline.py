@@ -403,8 +403,8 @@ def _produce_transactions_to_kafka(**context):
         logger.info("fraud__use_kafka_ingestion is false -- skipping Kafka produce.")
         return
 
-    #from kafka import KafkaProducer
-    from confluent_kafka import Producer
+    from kafka import KafkaProducer
+
     src_path = os.path.join(STAGING_DIR, "transactions_source.parquet")
     txn = pd.read_parquet(src_path)
     if txn.empty:
@@ -413,8 +413,12 @@ def _produce_transactions_to_kafka(**context):
     txn = txn.copy()
     txn["transaction_ts"] = txn["transaction_ts"].astype(str)  # JSON needs a plain string, not a Timestamp
 
-    producer = Producer(
+    producer = KafkaProducer(
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS.split(","),
+        security_protocol="SASL_PLAINTEXT",
+        sasl_mechanism="SCRAM-SHA-512",
+        sasl_plain_username="data-platform-user",
+        sasl_plain_password="RGdUTMy5TSue4GdNFEdmG5myMhPKpWIe",
         value_serializer=lambda v: json.dumps(v, default=str).encode("utf-8"),
         key_serializer=lambda k: k.encode("utf-8") if k else None,
         acks="all",
@@ -456,7 +460,7 @@ def _consume_transactions_from_kafka(**context):
         logger.info("fraud__use_kafka_ingestion is false -- copied transactions_source.parquet directly.")
         return
 
-    from confluent_kafka import Consumer
+    from kafka import KafkaConsumer
 
     produced_count = context["ti"].xcom_pull(
         task_ids="ingestion.produce_transactions_to_kafka", key="kafka_produced_count") or 0
@@ -465,6 +469,10 @@ def _consume_transactions_from_kafka(**context):
     consumer = Consumer(
         KAFKA_TOPIC_TRANSACTIONS,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS.split(","),
+        security_protocol="SASL_PLAINTEXT",
+        sasl_mechanism="SCRAM-SHA-512",
+        sasl_plain_username="data-platform-user",
+        sasl_plain_password="RGdUTMy5TSue4GdNFEdmG5myMhPKpWIe",      
         group_id=group_id,
         auto_offset_reset="earliest",
         enable_auto_commit=False,
