@@ -406,6 +406,7 @@ def _produce_transactions_to_kafka(**context):
     from kafka import KafkaProducer
 
     src_path = os.path.join(STAGING_DIR, "transactions_source.parquet")
+    _wait_for_file(os.path.join(STAGING_DIR, "transactions_source.parquet"))
     txn = pd.read_parquet(src_path)
     if txn.empty:
         raise AirflowException("No transactions to publish -- transactions_source.parquet is empty.")
@@ -504,6 +505,7 @@ def _consume_transactions_from_kafka(**context):
 
     txn = pd.DataFrame(records)
     txn["transaction_ts"] = pd.to_datetime(txn["transaction_ts"])
+    #_wait_for_file(os.path.join(STAGING_DIR, "transactions_source.parquet"))
     txn.to_parquet(os.path.join(STAGING_DIR, "transactions.parquet"), index=False)
     logger.info("Consumed %d transactions from Kafka -> transactions.parquet", len(txn))
     context["ti"].xcom_push(key="kafka_consumed_count", value=len(txn))
