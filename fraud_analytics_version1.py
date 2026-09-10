@@ -239,7 +239,7 @@ METRICS_PATH = os.path.join(MODEL_DIR, "metrics_candidate.json")
 CSV_FILES = ["customers.csv", "accounts.csv", "devices.csv", "merchants.csv",
              "transactions.csv", "fraud_events.csv", "alerts.csv", "cases.csv"]
 
-CLICKHOUSE_DB = _var("fraud__clickhouse_db", "fraud_demo")
+CLICKHOUSE_DB = _var("fraud__clickhouse_db", "analytics")
 
 # ---- spark-job-api (see module docstring for the real contract) ----
 SPARK_JOB_API_URL = _var("SPARK_JOB_API_URL", "http://jobapi.data-platform.tcs.private.cloud")
