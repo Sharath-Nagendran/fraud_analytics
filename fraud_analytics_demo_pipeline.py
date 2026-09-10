@@ -280,7 +280,7 @@ METRICS_PATH = os.path.join(MODEL_DIR, "metrics_candidate.json")
 CSV_FILES = ["customers.csv", "accounts.csv", "devices.csv", "merchants.csv",
              "transactions.csv", "fraud_events.csv", "alerts.csv", "cases.csv"]
 
-CLICKHOUSE_DB = _var("fraud__clickhouse_db", "fraud_demo")
+CLICKHOUSE_DB = _var("fraud__clickhouse_db", "analytics")
 
 # ---- Kafka ingestion (Phase 1 -- see module docstring) ----
 KAFKA_BOOTSTRAP_SERVERS = _var("KAFKA_BOOTSTRAP_SERVERS", "kafka-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092")
