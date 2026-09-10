@@ -283,11 +283,13 @@ CSV_FILES = ["customers.csv", "accounts.csv", "devices.csv", "merchants.csv",
 CLICKHOUSE_DB = _var("fraud__clickhouse_db", "fraud_demo")
 
 # ---- Kafka ingestion (Phase 1 -- see module docstring) ----
-KAFKA_BOOTSTRAP_SERVERS = _var("KAFKA_BOOTSTRAP_SERVERS", "kafka.data-platform.svc.cluster.local:9092")
+KAFKA_BOOTSTRAP_SERVERS = _var("KAFKA_BOOTSTRAP_SERVERS", "kafka-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092")
 KAFKA_TOPIC_TRANSACTIONS = _var("fraud__kafka_topic_transactions", "data-platform-fraud.transactions.raw")
 KAFKA_CONSUME_IDLE_TIMEOUT_MS = int(_var("fraud__kafka_consume_idle_timeout_ms", "8000"))
 KAFKA_PRODUCE_BATCH_SIZE = int(_var("fraud__kafka_produce_batch_size", "500"))
 USE_KAFKA_INGESTION = str(_var("fraud__use_kafka_ingestion", "true")).lower() == "true"
+KAFKA_USER="data-platform-user"
+KAFKA_PASSWORD="OqaWajwm5oro2rPI7Tq48SQNu8FUGr4E"
 
 # ---- spark-job-api (see module docstring for the real contract) ----
 SPARK_JOB_API_URL = _var("SPARK_JOB_API_URL", "http://jobapi.data-platform.tcs.private.cloud")
@@ -418,8 +420,8 @@ def _produce_transactions_to_kafka(**context):
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS.split(","),
         security_protocol="SASL_PLAINTEXT",
         sasl_mechanism="SCRAM-SHA-512",
-        sasl_plain_username="data-platform-user",
-        sasl_plain_password="OqaWajwm5oro2rPI7Tq48SQNu8FUGr4E",
+        sasl_plain_username=KAFKA_USER,
+        sasl_plain_password=KAFKA_PASSWORD,
         value_serializer=lambda v: json.dumps(v, default=str).encode("utf-8"),
         key_serializer=lambda k: k.encode("utf-8") if k else None,
         acks="all",
@@ -472,8 +474,8 @@ def _consume_transactions_from_kafka(**context):
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS.split(","),
         security_protocol="SASL_PLAINTEXT",
         sasl_mechanism="SCRAM-SHA-512",
-        sasl_plain_username="data-platform-user",
-        sasl_plain_password="OqaWajwm5oro2rPI7Tq48SQNu8FUGr4E",      
+        sasl_plain_username=KAFKA_USER,
+        sasl_plain_password=KAFKA_PASSWORD,      
         group_id=group_id,
         auto_offset_reset="earliest",
         enable_auto_commit=False,
