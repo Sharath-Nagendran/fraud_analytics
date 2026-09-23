@@ -175,47 +175,83 @@ USE_CASE = "fraud_analytics"
 import time
 import stat
 
-def _wait_for_file(filepath, max_retries=10, backoff_seconds=1, min_size_bytes=100):
+def _wait_for_file(filepath, max_retries=15, backoff_seconds=1, min_size_bytes=100):
     """
     Wait for a file to exist, be readable, and have a minimum size (not just touch).
     Handles PVC eventual-consistency and incomplete writes.
+    
+    Args:
+        filepath: Path to wait for
+        max_retries: Number of retry attempts (default 15)
+        backoff_seconds: Initial backoff in seconds, doubles each retry
+        min_size_bytes: Minimum file size to consider "written"
     """
+    logger.info("Waiting for file to be readable: %s (max_retries=%d)", filepath, max_retries)
+    
     for attempt in range(max_retries):
         try:
             if not os.path.exists(filepath):
-                logger.warning(f"File {filepath} not found yet (attempt {attempt+1}/{max_retries})")
+                logger.debug(
+                    f"Attempt {attempt+1}/{max_retries}: File {filepath} not found yet. "
+                    f"Parent dir exists: {os.path.isdir(os.path.dirname(filepath))}"
+                )
             else:
                 # File exists — check if it's readable and has content
                 file_size = os.path.getsize(filepath)
                 if file_size < min_size_bytes:
-                    logger.warning(f"File {filepath} exists but only {file_size} bytes (attempt {attempt+1}/{max_retries}, need >{min_size_bytes})")
+                    logger.debug(
+                        f"Attempt {attempt+1}/{max_retries}: File {filepath} exists but only "
+                        f"{file_size} bytes (need >{min_size_bytes})"
+                    )
                 else:
                     # Try to actually read a chunk to confirm it's not truncated/corrupted
-                    with open(filepath, 'rb') as f:
-                        chunk = f.read(min(1024, file_size))
-                    logger.info(f"File {filepath} confirmed readable ({file_size} bytes) after {attempt} attempts")
-                    return
+                    try:
+                        with open(filepath, 'rb') as f:
+                            chunk = f.read(min(1024, file_size))
+                        if not chunk:
+                            logger.debug(
+                                f"Attempt {attempt+1}/{max_retries}: File exists ({file_size} bytes) "
+                                f"but read returned empty"
+                            )
+                        else:
+                            logger.info(f"✓ File {filepath} is readable ({file_size} bytes) after {attempt} retries")
+                            return
+                    except (IOError, OSError) as read_err:
+                        logger.debug(f"Attempt {attempt+1}/{max_retries}: Cannot read file: {read_err}")
         except (IOError, OSError) as e:
-            logger.warning(f"File {filepath} error (attempt {attempt+1}/{max_retries}): {e}")
+            logger.debug(f"Attempt {attempt+1}/{max_retries}: OS error on {filepath}: {e}")
         
         if attempt < max_retries - 1:
-            sleep_time = backoff_seconds * (2 ** attempt)  # exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, 64s, 128s, 256s, 512s
-            logger.info(f"Waiting {sleep_time}s before retry...")
+            sleep_time = backoff_seconds * (2 ** attempt)
+            logger.debug(f"  Waiting {sleep_time}s before retry...")
             time.sleep(sleep_time)
         else:
-            # One last diagnostic attempt
+            # Final diagnostic attempt
+            parent_dir = os.path.dirname(filepath)
+            diagnostics = {
+                "parent_dir_exists": os.path.isdir(parent_dir),
+                "file_exists": os.path.exists(filepath),
+            }
+            
             if os.path.exists(filepath):
                 try:
-                    file_size = os.path.getsize(filepath)
-                    file_stat = os.stat(filepath)
-                    logger.error(
-                        f"File {filepath} exists ({file_size} bytes) but never became readable. "
-                        f"Permissions: {oct(file_stat.st_mode)}, Owner: {file_stat.st_uid}:{file_stat.st_gid}"
-                    )
-                except Exception as diag_e:
-                    logger.error(f"File {filepath} exists but can't stat it: {diag_e}")
-            raise AirflowException(f"File {filepath} never became readable after {max_retries} attempts (checked size, permissions, and content)")
-
+                    stat_info = os.stat(filepath)
+                    diagnostics["file_size_bytes"] = stat_info.st_size
+                    diagnostics["file_mode"] = oct(stat_info.st_mode)
+                    diagnostics["file_uid_gid"] = f"{stat_info.st_uid}:{stat_info.st_gid}"
+                except Exception as stat_e:
+                    diagnostics["stat_error"] = str(stat_e)
+            
+            if os.path.isdir(parent_dir):
+                try:
+                    diagnostics["parent_dir_contents"] = os.listdir(parent_dir)
+                except Exception as list_e:
+                    diagnostics["listdir_error"] = str(list_e)
+            
+            raise AirflowException(
+                f"File {filepath} never became readable after {max_retries} retries. "
+                f"Diagnostics: {diagnostics}"
+            )
 
 
 def _var(key: str, default=None):
@@ -401,6 +437,9 @@ def _produce_transactions_to_kafka(**context):
     call, so swapping this task out for an external producer later is a
     config change, not a rearchitecture.
     """
+    # GUARD: Ensure directory exists
+    os.makedirs(STAGING_DIR, exist_ok=True)
+    
     if not USE_KAFKA_INGESTION:
         logger.info("fraud__use_kafka_ingestion is false -- skipping Kafka produce.")
         return
@@ -408,7 +447,7 @@ def _produce_transactions_to_kafka(**context):
     from kafka import KafkaProducer
 
     src_path = os.path.join(STAGING_DIR, "transactions_source.parquet")
-    _wait_for_file(os.path.join(STAGING_DIR, "transactions_source.parquet"))
+    _wait_for_file(src_path)  # This now has better diagnostics and retries
     txn = pd.read_parquet(src_path)
     if txn.empty:
         raise AirflowException("No transactions to publish -- transactions_source.parquet is empty.")
@@ -454,12 +493,15 @@ def _consume_transactions_from_kafka(**context):
     what this run's produce task just published, regardless of prior
     runs' committed offsets.
     """
+    # GUARD: Ensure directory exists
+    os.makedirs(STAGING_DIR, exist_ok=True)
+    
     if not USE_KAFKA_INGESTION:
         import shutil
-        shutil.copyfile(
-            os.path.join(STAGING_DIR, "transactions_source.parquet"),
-            os.path.join(STAGING_DIR, "transactions.parquet"),
-        )
+        src_path = os.path.join(STAGING_DIR, "transactions_source.parquet")
+        _wait_for_file(src_path)  # Wait for source before copying
+        dst_path = os.path.join(STAGING_DIR, "transactions.parquet")
+        shutil.copyfile(src_path, dst_path)
         logger.info("fraud__use_kafka_ingestion is false -- copied transactions_source.parquet directly.")
         return
 
@@ -507,9 +549,9 @@ def _consume_transactions_from_kafka(**context):
 
     txn = pd.DataFrame(records)
     txn["transaction_ts"] = pd.to_datetime(txn["transaction_ts"])
-    #_wait_for_file(os.path.join(STAGING_DIR, "transactions_source.parquet"))
-    txn.to_parquet(os.path.join(STAGING_DIR, "transactions.parquet"), index=False)
-    logger.info("Consumed %d transactions from Kafka -> transactions.parquet", len(txn))
+    dst_path = os.path.join(STAGING_DIR, "transactions.parquet")
+    txn.to_parquet(dst_path, index=False)
+    logger.info("Consumed %d transactions from Kafka -> %s", len(txn), dst_path)
     context["ti"].xcom_push(key="kafka_consumed_count", value=len(txn))
 
 
@@ -693,7 +735,13 @@ def _generate_synthetic_dataset():
 def _load_demo_data(**context):
     params = context.get("params", {}) or {}
     data_dir = params.get("demo_data_dir") or DEMO_DATA_DIR
-    os.makedirs(STAGING_DIR, exist_ok=True)
+    
+    # GUARD: Ensure staging directory exists with explicit error handling
+    try:
+        os.makedirs(STAGING_DIR, exist_ok=True)
+        logger.info("Staging directory ready: %s", STAGING_DIR)
+    except OSError as e:
+        raise AirflowException(f"Failed to create staging directory {STAGING_DIR}: {e}")
 
     frames, source = {}, "csv"
     if os.path.isdir(data_dir) and os.path.exists(os.path.join(data_dir, "transactions.csv")):
@@ -714,8 +762,10 @@ def _load_demo_data(**context):
         # produce/consume_transactions_from_kafka below); every other
         # dimension table is unchanged.
         fname = "transactions_source.parquet" if key == "transactions" else f"{key}.parquet"
-        df.to_parquet(os.path.join(STAGING_DIR, fname), index=False)
+        fpath = os.path.join(STAGING_DIR, fname)
+        df.to_parquet(fpath, index=False)
         row_counts[key] = len(df)
+        logger.info("Wrote %s (%d rows) -> %s", key, len(df), fpath)
 
     logger.info("Row counts (%s): %s", source, row_counts)
     context["ti"].xcom_push(key="row_counts", value=row_counts)
@@ -755,6 +805,9 @@ def _validate_data(**context):
 
 
 def _engineer_features(**context):
+    # GUARD: Ensure directory exists
+    os.makedirs(STAGING_DIR, exist_ok=True)
+    
     _wait_for_file(os.path.join(STAGING_DIR, "transactions.parquet"))
     txn = pd.read_parquet(os.path.join(STAGING_DIR, "transactions.parquet"))
     txn["transaction_ts"] = pd.to_datetime(txn["transaction_ts"])
@@ -800,6 +853,8 @@ def _snapshot_via_spark_sql(**context):
 
 
 def _train_or_score_model(**context):
+    # GUARD: Ensure both directories exist
+    os.makedirs(STAGING_DIR, exist_ok=True)
     os.makedirs(MODEL_DIR, exist_ok=True)
 
     if USE_SPARK_JOB_API:
@@ -908,6 +963,9 @@ def _promote_model(**context):
 
 
 def _load_curated_postgres(**context):
+    # GUARD: Ensure directory exists
+    os.makedirs(STAGING_DIR, exist_ok=True)
+    
     import psycopg2
     from psycopg2.extras import execute_values
 
@@ -949,7 +1007,11 @@ def _load_curated_postgres(**context):
         conn.close()
 
 
+
 def _refresh_clickhouse_gold(**context):
+    # GUARD: Ensure directory exists
+    os.makedirs(STAGING_DIR, exist_ok=True)
+    
     import clickhouse_connect
 
     ch = None
