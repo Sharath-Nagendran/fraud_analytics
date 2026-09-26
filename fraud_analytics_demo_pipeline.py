@@ -307,7 +307,7 @@ def _conn_or_env(conn_id: str, host_env: str, port_env: str, user_env: str,
 
 DEMO_DATA_DIR = _var("fraud__demo_data_dir",
                       "/opt/airflow/dags/data-platform/airflow_usecase/fraud-risk/demo_pack")
-STAGING_DIR = _var("fraud__staging_dir", "/opt/airflow/staging/fraud_analytics")
+STAGING_DIR = _var("fraud__staging_dir", "/opt/airflow/dags/.staging/fraud_analytics")
 MODEL_DIR = _var("fraud__model_dir", "/models/fraud_analytics")
 MODEL_CANDIDATE_PATH = os.path.join(MODEL_DIR, "fraud_model_candidate.joblib")
 MODEL_PRODUCTION_PATH = os.path.join(MODEL_DIR, "fraud_model_production.joblib")
