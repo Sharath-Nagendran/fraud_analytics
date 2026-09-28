@@ -317,7 +317,7 @@ CSV_FILES = ["customers.csv", "accounts.csv", "devices.csv", "merchants.csv",
              "transactions.csv", "fraud_events.csv", "alerts.csv", "cases.csv"]
 
 CLICKHOUSE_DB = _var("fraud__clickhouse_db", "analytics")
-
+POSTGRES_DB = "airflow_data_platform"
 # ---- Kafka ingestion (Phase 1 -- see module docstring) ----
 KAFKA_BOOTSTRAP_SERVERS = _var("KAFKA_BOOTSTRAP_SERVERS", "kafka-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092")
 KAFKA_TOPIC_TRANSACTIONS = _var("fraud__kafka_topic_transactions", "data-platform-fraud.transactions.raw")
@@ -970,7 +970,7 @@ def _load_curated_postgres(**context):
     from psycopg2.extras import execute_values
 
     pg = _conn_or_env("postgres_default", "MY_POSTGRES_HOST", "MY_POSTGRES_PORT",
-                       "MY_POSTGRES_USER", "MY_POSTGRES_PASSWORD", "MY_POSTGRES_DB", 5432, "data_warehouse")
+                       "MY_POSTGRES_USER", "MY_POSTGRES_PASSWORD", "MY_POSTGRES_DB", 5432, POSTGRES_DB)
     _wait_for_file(os.path.join(STAGING_DIR, "transactions_features.parquet"))
     txn = pd.read_parquet(os.path.join(STAGING_DIR, "transactions_features.parquet"))
     cols = [c for c in ["transaction_id", "transaction_ts", "customer_id", "channel", "amount_inr",
