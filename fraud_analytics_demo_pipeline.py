@@ -969,7 +969,7 @@ def _load_curated_postgres(**context):
     import psycopg2
     from psycopg2.extras import execute_values
 
-    pg = _conn_or_env("fraud_postgres_default", "MY_POSTGRES_HOST", "MY_POSTGRES_PORT",
+    pg = _conn_or_env("postgres_default", "MY_POSTGRES_HOST", "MY_POSTGRES_PORT",
                        "MY_POSTGRES_USER", "MY_POSTGRES_PASSWORD", "MY_POSTGRES_DB", 5432, "data_warehouse")
     _wait_for_file(os.path.join(STAGING_DIR, "transactions_features.parquet"))
     txn = pd.read_parquet(os.path.join(STAGING_DIR, "transactions_features.parquet"))
