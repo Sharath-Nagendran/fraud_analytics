@@ -61,21 +61,54 @@ def _get_rabbitmq_connection():
     if BaseHook is not None:
         try:
             conn = BaseHook.get_connection("rabbitmq_default")
-            return {
-                "host": conn.host,
-                "port": conn.port or 5672,
-                "login": conn.login,
-                "password": conn.password,
-            }
+            if conn and conn.host:
+                logger.info("Using rabbitmq_default from Airflow connection")
+                return {
+                    "host": conn.host,
+                    "port": conn.port or 5672,
+                    "login": conn.login or "guest",
+                    "password": conn.password,
+                }
         except Exception as e:
             logger.warning("Could not load rabbitmq_default from Airflow: %s. Trying env vars...", e)
 
     # Fallback to environment variables
     import os
-    host = os.getenv("RABBITMQ_HOST", "rabbitmq.data-platform.svc.cluster.local")
-    port = int(os.getenv("RABBITMQ_PORT", "5672"))
+    import re
+    
+    # Try to get from env vars, handling full URIs like tcp://host:port
+    host_env = os.getenv("RABBITMQ_HOST", "")
+    port_env = os.getenv("RABBITMQ_PORT", "")
+    
+    # Parse full URI if provided (e.g., tcp://10.109.88.13:5672)
+    if host_env.startswith("tcp://") or host_env.startswith("amqp://"):
+        match = re.match(r"^(?:tcp|amqp)://([^:]+):(\d+)$", host_env)
+        if match:
+            host, port = match.groups()
+            port = int(port)
+        else:
+            raise AirflowException(f"Could not parse RabbitMQ URI: {host_env}")
+    elif port_env.startswith("tcp://") or port_env.startswith("amqp://"):
+        # Sometimes the full URI ends up in RABBITMQ_PORT
+        match = re.match(r"^(?:tcp|amqp)://([^:]+):(\d+)$", port_env)
+        if match:
+            host, port = match.groups()
+            port = int(port)
+        else:
+            raise AirflowException(f"Could not parse RabbitMQ URI from RABBITMQ_PORT: {port_env}")
+    else:
+        # Standard case: separate host and port
+        host = host_env or "rabbitmq.data-platform.svc.cluster.local"
+        try:
+            port = int(port_env) if port_env else 5672
+        except ValueError:
+            raise AirflowException(
+                f"RABBITMQ_PORT must be a number, got: {port_env}. "
+                f"Use the Airflow connection 'rabbitmq_default' instead of env vars."
+            )
+    
     login = os.getenv("RABBITMQ_USER", "rmq_user")
-    password = os.getenv("RABBITMQ_PASSWORD")
+    password = os.getenv("RABBITMQ_PASSWORD", os.getenv("RABBITMQ_PASS", ""))
     
     if not password:
         raise AirflowException(
@@ -83,6 +116,7 @@ def _get_rabbitmq_connection():
             "rabbitmq_default connection in Airflow."
         )
     
+    logger.info("Using RabbitMQ from environment variables: host=%s, port=%s", host, port)
     return {"host": host, "port": port, "login": login, "password": password}
 
 
