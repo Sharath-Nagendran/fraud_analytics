@@ -1,230 +1,304 @@
-#!/usr/bin/env python3
 """
-Test RabbitMQ Connection (Works with Generic Type)
-Can be run as standalone Python script or in Airflow DAG
+rabbitmq_test_dag.py
+
+Standalone DAG for testing RabbitMQ connection from Airflow.
+Place this file in: /opt/airflow/dags/
+
+This DAG:
+1. Publishes 5 test messages to a RabbitMQ queue
+2. Consumes them back
+3. Verifies round-trip success
+4. Tests the rabbitmq_default connection from Airflow
 """
 
-import logging
 import json
-from datetime import datetime
+import logging
+from datetime import datetime, timedelta
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+from airflow import DAG
+from airflow.exceptions import AirflowException
+from airflow.operators.python import PythonOperator
+
+try:
+    from airflow.hooks.base import BaseHook
+except Exception:
+    BaseHook = None
+
 logger = logging.getLogger(__name__)
 
-def test_rabbitmq_direct():
+# ============================================================
+# Configuration
+# ============================================================
+RABBITMQ_QUEUE = "airflow_test_queue"
+TEST_MESSAGE_COUNT = 5
+
+default_args = {
+    "owner": "data-platform",
+    "depends_on_past": False,
+    "start_date": datetime(2026, 9, 1),
+    "email_on_failure": False,
+    "email_on_retry": False,
+    "retries": 1,
+    "retry_delay": timedelta(minutes=2),
+    "execution_timeout": timedelta(minutes=10),
+}
+
+
+# ============================================================
+# Helper: Get RabbitMQ connection details from Airflow
+# ============================================================
+def _get_rabbitmq_connection():
     """
-    Test RabbitMQ directly (doesn't require Airflow connection)
-    Use this for quick validation
-    """
-    logger.info("Testing RabbitMQ direct connection...")
+    Resolve RabbitMQ connection from Airflow's rabbitmq_default connection.
+    Falls back to environment variables if BaseHook is not available.
     
+    Returns:
+        dict: {host, port, login, password}
+    
+    Raises:
+        AirflowException: If connection cannot be resolved
+    """
+    if BaseHook is not None:
+        try:
+            conn = BaseHook.get_connection("rabbitmq_default")
+            return {
+                "host": conn.host,
+                "port": conn.port or 5672,
+                "login": conn.login,
+                "password": conn.password,
+            }
+        except Exception as e:
+            logger.warning("Could not load rabbitmq_default from Airflow: %s. Trying env vars...", e)
+
+    # Fallback to environment variables
+    import os
+    host = os.getenv("RABBITMQ_HOST", "rabbitmq.data-platform.svc.cluster.local")
+    port = int(os.getenv("RABBITMQ_PORT", "5672"))
+    login = os.getenv("RABBITMQ_USER", "rmq_user")
+    password = os.getenv("RABBITMQ_PASSWORD")
+    
+    if not password:
+        raise AirflowException(
+            "RabbitMQ password not found. Set RABBITMQ_PASSWORD env var or create "
+            "rabbitmq_default connection in Airflow."
+        )
+    
+    return {"host": host, "port": port, "login": login, "password": password}
+
+
+# ============================================================
+# Task 1: Test Connection & Publish Messages
+# ============================================================
+def _test_connection_and_publish(**context):
+    """
+    Test RabbitMQ connection and publish test messages to the queue.
+    """
     try:
         import pika
-        
-        host = "rabbitmq.data-platform.svc.cluster.local"
-        port = 5672
-        username = "rmq_user"
-        password = "RabbitMQStrongPass123"
-        
-        # Step 1: Create credentials
-        logger.info(f"✓ Connecting to {host}:{port}")
-        credentials = pika.PlainCredentials(username, password)
-        
-        # Step 2: Create connection parameters
+    except ImportError:
+        raise AirflowException(
+            "pika library not installed. Run: pip install pika"
+        )
+    
+    logger.info("=" * 80)
+    logger.info("TASK 1: Testing RabbitMQ Connection & Publishing Messages")
+    logger.info("=" * 80)
+    
+    # Get connection details
+    conn_details = _get_rabbitmq_connection()
+    logger.info("RabbitMQ connection details: host=%s, port=%s, user=%s",
+                conn_details["host"], conn_details["port"], conn_details["login"])
+    
+    # Create connection
+    try:
+        credentials = pika.PlainCredentials(conn_details["login"], conn_details["password"])
         parameters = pika.ConnectionParameters(
-            host=host,
-            port=port,
+            host=conn_details["host"],
+            port=conn_details["port"],
             credentials=credentials,
             connection_attempts=3,
             retry_delay=2,
             heartbeat=600,
-            blocked_connection_timeout=300
+            blocked_connection_timeout=300,
         )
-        logger.info("✓ Connection parameters created")
-        
-        # Step 3: Create connection
         connection = pika.BlockingConnection(parameters)
         logger.info("✓ Connected to RabbitMQ broker")
-        
-        # Step 4: Create channel
-        channel = connection.channel()
-        logger.info("✓ Channel created")
-        
-        # Step 5: Declare queue
-        queue_name = "airflow_test_queue"
-        channel.queue_declare(queue=queue_name, durable=True)
-        logger.info(f"✓ Queue declared: {queue_name}")
-        
-        # Step 6: Publish message
-        test_message = json.dumps({
-            "test_id": "airflow_connection_test",
-            "timestamp": datetime.now().isoformat(),
-            "status": "success",
-            "message": "Connection test successful"
-        })
-        
-        channel.basic_publish(
-            exchange='',
-            routing_key=queue_name,
-            body=test_message.encode('utf-8'),
-            properties=pika.BasicProperties(
-                delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE
-            )
-        )
-        logger.info(f"✓ Message published to queue: {queue_name}")
-        logger.info(f"  Message content: {test_message}")
-        
-        # Step 7: Verify by consuming
-        received_messages = []
-        
-        def callback(ch, method, properties, body):
-            message = json.loads(body.decode('utf-8'))
-            received_messages.append(message)
-            logger.info(f"✓ Message consumed: {message['test_id']}")
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-        
-        channel.basic_qos(prefetch_count=1)
-        channel.basic_consume(queue=queue_name, on_message_callback=callback)
-        
-        # Consume with timeout
-        logger.info("Waiting for message...")
-        channel.connection.call_later(2, lambda: channel.stop_consuming())
-        channel.basic_consume(queue=queue_name, on_message_callback=callback, auto_ack=False)
-        
-        # Step 8: Close connection
-        connection.close()
-        logger.info("✓ Connection closed")
-        
-        logger.info("\n" + "="*60)
-        logger.info("✓ RABBITMQ CONNECTION TEST: PASSED")
-        logger.info("="*60)
-        logger.info(f"✓ Published: 1 message")
-        logger.info(f"✓ Consumed: {len(received_messages)} message(s)")
-        logger.info(f"✓ Queue name: {queue_name}")
-        
-        return {
-            "status": "PASS",
-            "message": "RabbitMQ connection successful",
-            "operations": ["connect", "channel_create", "queue_declare", "publish", "consume"],
-            "host": host,
-            "port": port
-        }
-        
+    except pika.exceptions.AMQPConnectionError as e:
+        raise AirflowException(f"Failed to connect to RabbitMQ: {e}")
     except Exception as e:
-        logger.error(f"✗ Error: {str(e)}", exc_info=True)
-        logger.info("\n" + "="*60)
-        logger.info("✗ RABBITMQ CONNECTION TEST: FAILED")
-        logger.info("="*60)
-        
-        return {
-            "status": "FAIL",
-            "message": str(e),
-            "error": type(e).__name__
-        }
-
-
-def test_rabbitmq_via_airflow_connection():
-    """
-    Test RabbitMQ via Airflow connection
-    Requires: airflow connection to exist
-    """
-    logger.info("Testing RabbitMQ via Airflow connection...")
+        raise AirflowException(f"Unexpected error connecting to RabbitMQ: {e}")
     
     try:
-        from airflow.models import Connection
-        from airflow.exceptions import AirflowException
-        from sqlalchemy import create_engine
-        from sqlalchemy.orm import sessionmaker
-        
-        # Get connection from Airflow metadata
-        from airflow import settings
-        Session = sessionmaker(bind=settings.engine)
-        session = Session()
-        
-        conn = session.query(Connection).filter_by(conn_id='rabbitmq_default').first()
-        
-        if not conn:
-            raise AirflowException("Connection 'rabbitmq_default' not found in Airflow")
-        
-        logger.info(f"✓ Found connection: {conn.conn_id}")
-        logger.info(f"  Type: {conn.conn_type}")
-        logger.info(f"  Host: {conn.host}")
-        logger.info(f"  Port: {conn.port}")
-        logger.info(f"  Login: {conn.login}")
-        
-        # Extract connection details
-        host = conn.host
-        port = conn.port or 5672
-        username = conn.login
-        password = conn.password
-        
-        # Now test with pika
-        import pika
-        
-        credentials = pika.PlainCredentials(username, password)
-        parameters = pika.ConnectionParameters(
-            host=host,
-            port=port,
-            credentials=credentials,
-            connection_attempts=3,
-            retry_delay=2
-        )
-        
-        connection = pika.BlockingConnection(parameters)
-        logger.info("✓ Connected via Airflow connection")
-        
         channel = connection.channel()
-        logger.info("✓ Channel created")
+        logger.info("✓ Created channel")
         
-        # Test queue operations
-        queue_name = "airflow"
-        channel.queue_declare(queue=queue_name, durable=True)
-        logger.info(f"✓ Queue verified: {queue_name}")
+        # Declare the queue (idempotent)
+        channel.queue_declare(queue=RABBITMQ_QUEUE, durable=True)
+        logger.info("✓ Declared queue: %s", RABBITMQ_QUEUE)
         
-        connection.close()
-        logger.info("✓ Connection closed")
+        # Publish test messages
+        messages = []
+        for i in range(TEST_MESSAGE_COUNT):
+            msg = {
+                "id": i + 1,
+                "timestamp": datetime.utcnow().isoformat(),
+                "message": f"Test message {i + 1}",
+                "test_run_id": context["run_id"],
+            }
+            msg_body = json.dumps(msg)
+            
+            channel.basic_publish(
+                exchange="",
+                routing_key=RABBITMQ_QUEUE,
+                body=msg_body,
+                properties=pika.BasicProperties(delivery_mode=2),  # Make message persistent
+            )
+            messages.append(msg)
+            logger.info("  Published message %d/%d: %s", i + 1, TEST_MESSAGE_COUNT, msg["message"])
         
-        return {
-            "status": "PASS",
-            "message": "Airflow RabbitMQ connection successful",
-            "conn_id": "rabbitmq_default"
-        }
+        logger.info("✓ Published %d test messages to queue '%s'", TEST_MESSAGE_COUNT, RABBITMQ_QUEUE)
+        
+        # Push metrics to XCom for next task
+        context["ti"].xcom_push(key="messages_published", value=len(messages))
+        context["ti"].xcom_push(key="test_run_id", value=context["run_id"])
         
     except Exception as e:
-        logger.error(f"✗ Error: {str(e)}", exc_info=True)
-        return {
-            "status": "FAIL",
-            "message": str(e),
-            "error": type(e).__name__
-        }
+        raise AirflowException(f"Error publishing messages: {e}")
+    finally:
+        connection.close()
+        logger.info("✓ Closed RabbitMQ connection")
 
 
-def main():
-    """Run both tests"""
-    logger.info("\n" + "="*60)
-    logger.info("RABBITMQ CONNECTION TESTING")
-    logger.info("="*60 + "\n")
+# ============================================================
+# Task 2: Consume & Verify Messages
+# ============================================================
+def _consume_and_verify(**context):
+    """
+    Consume the test messages from the queue and verify they match.
+    """
+    try:
+        import pika
+    except ImportError:
+        raise AirflowException("pika library not installed. Run: pip install pika")
     
-    # Test 1: Direct connection (always works)
-    logger.info("[1/2] Testing direct connection...")
-    result1 = test_rabbitmq_direct()
+    logger.info("=" * 80)
+    logger.info("TASK 2: Consuming & Verifying Messages")
+    logger.info("=" * 80)
     
-    # Test 2: Via Airflow (requires connection to exist)
-    logger.info("\n[2/2] Testing via Airflow connection...")
-    result2 = test_rabbitmq_via_airflow_connection()
+    # Get expected message count from previous task
+    expected_count = context["ti"].xcom_pull(
+        task_ids="test_connection_and_publish", key="messages_published") or TEST_MESSAGE_COUNT
+    test_run_id = context["ti"].xcom_pull(
+        task_ids="test_connection_and_publish", key="test_run_id")
     
-    # Summary
-    logger.info("\n" + "="*60)
-    logger.info("SUMMARY")
-    logger.info("="*60)
-    logger.info(f"Direct test: {result1['status']}")
-    logger.info(f"Airflow test: {result2['status']}")
+    logger.info("Expecting to consume %d messages (test_run_id=%s)", expected_count, test_run_id)
     
-    return result1, result2
+    # Get connection details
+    conn_details = _get_rabbitmq_connection()
+    
+    # Create connection
+    try:
+        credentials = pika.PlainCredentials(conn_details["login"], conn_details["password"])
+        parameters = pika.ConnectionParameters(
+            host=conn_details["host"],
+            port=conn_details["port"],
+            credentials=credentials,
+            connection_attempts=3,
+            retry_delay=2,
+        )
+        connection = pika.BlockingConnection(parameters)
+        logger.info("✓ Connected to RabbitMQ broker")
+    except pika.exceptions.AMQPConnectionError as e:
+        raise AirflowException(f"Failed to connect to RabbitMQ: {e}")
+    
+    try:
+        channel = connection.channel()
+        logger.info("✓ Created channel")
+        
+        # Declare the queue (in case this task runs before publish in a rerun)
+        channel.queue_declare(queue=RABBITMQ_QUEUE, durable=True)
+        
+        # Consume messages
+        consumed_messages = []
+        consume_timeout_seconds = 10
+        
+        def on_message(ch, method, properties, body):
+            try:
+                msg = json.loads(body.decode("utf-8"))
+                consumed_messages.append(msg)
+                logger.info("  Consumed message %d/%d: %s", len(consumed_messages), expected_count, msg["message"])
+                ch.basic_ack(delivery_tag=method.delivery_tag)
+            except Exception as e:
+                logger.error("Error processing message: %s", e)
+                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+        
+        channel.basic_consume(queue=RABBITMQ_QUEUE, on_message_callback=on_message)
+        logger.info("Waiting for messages (timeout=%ds)...", consume_timeout_seconds)
+        
+        # This will timeout and stop consuming after the specified seconds of no messages
+        try:
+            connection.call_later(consume_timeout_seconds, connection.stop)
+            channel.start_consuming()
+        except Exception as e:
+            logger.warning("Consumer loop interrupted: %s", e)
+        
+        logger.info("✓ Consumed %d messages from queue '%s'", len(consumed_messages), RABBITMQ_QUEUE)
+        
+        # Verify we got what we sent
+        if len(consumed_messages) != expected_count:
+            raise AirflowException(
+                f"Message count mismatch: sent {expected_count}, consumed {len(consumed_messages)}"
+            )
+        
+        # Verify each message's structure
+        for i, msg in enumerate(consumed_messages, 1):
+            if not all(k in msg for k in ["id", "timestamp", "message", "test_run_id"]):
+                raise AirflowException(f"Message {i} has invalid structure: {msg}")
+            if msg["test_run_id"] != test_run_id:
+                raise AirflowException(
+                    f"Message {i} test_run_id mismatch: expected {test_run_id}, got {msg['test_run_id']}"
+                )
+        
+        logger.info("✓ All messages verified successfully")
+        logger.info("=" * 80)
+        logger.info("✓✓✓ RABBITMQ CONNECTION TEST PASSED ✓✓✓")
+        logger.info("=" * 80)
+        
+        # Push summary to XCom
+        context["ti"].xcom_push(key="messages_consumed", value=len(consumed_messages))
+        context["ti"].xcom_push(key="test_status", value="PASSED")
+        
+    except Exception as e:
+        logger.error("Error consuming messages: %s", e)
+        raise AirflowException(f"Consumption failed: {e}")
+    finally:
+        connection.close()
+        logger.info("✓ Closed RabbitMQ connection")
 
 
-if __name__ == "__main__":
-    main()
+# ============================================================
+# DAG Definition
+# ============================================================
+with DAG(
+    dag_id="rabbitmq_connection_test",
+    default_args=default_args,
+    description="Test RabbitMQ connection: publish -> consume -> verify",
+    schedule=None,  # Manual trigger only
+    catchup=False,
+    tags=["rabbitmq", "test", "connection"],
+    doc_md=__doc__,
+) as dag:
+
+    publish_task = PythonOperator(
+        task_id="test_connection_and_publish",
+        python_callable=_test_connection_and_publish,
+        doc="Test RabbitMQ connection and publish test messages",
+    )
+
+    consume_task = PythonOperator(
+        task_id="consume_and_verify",
+        python_callable=_consume_and_verify,
+        doc="Consume messages and verify they match what was sent",
+    )
+
+    publish_task >> consume_task
