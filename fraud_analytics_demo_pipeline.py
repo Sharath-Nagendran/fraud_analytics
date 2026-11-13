@@ -325,7 +325,7 @@ KAFKA_CONSUME_IDLE_TIMEOUT_MS = int(_var("fraud__kafka_consume_idle_timeout_ms",
 KAFKA_PRODUCE_BATCH_SIZE = int(_var("fraud__kafka_produce_batch_size", "500"))
 USE_KAFKA_INGESTION = str(_var("fraud__use_kafka_ingestion", "true")).lower() == "true"
 KAFKA_USER="data-platform-user"
-KAFKA_PASSWORD="xR4OInzxv1MiNoqRaH0vdI2PVzNsiuA7"
+KAFKA_PASSWORD="pXg1KUvyCNMEZntK1QIzqdlygnM0XjxN"
 
 # ---- spark-job-api (see module docstring for the real contract) ----
 SPARK_JOB_API_URL = _var("SPARK_JOB_API_URL", "http://jobapi.data-platform.tcs.private.cloud")
